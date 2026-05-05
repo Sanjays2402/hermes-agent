@@ -2292,3 +2292,178 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+class TestRunJobLocalModelDiscovery:
+    """Regression: cron jobs without a pinned model must query the local
+    inference server's loaded model at run time, instead of freezing the
+    config.yaml default at job-creation time.
+
+    See issue #20125: when llama.cpp loaded a different model than the one
+    in config.yaml, jobs failed silently with a generic "Connection error".
+    """
+
+    def test_job_without_model_queries_local_v1_models(self, tmp_path):
+        """When runtime resolves to a loopback URL and the job has no
+        explicit model, the scheduler must hit /v1/models and pass the
+        live model id into AIAgent."""
+        job = {
+            "id": "local-job",
+            "name": "test",
+            "prompt": "hello",
+            # NB: no "model" key — forces live discovery.
+        }
+        fake_db = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.ok = True
+        fake_resp.json.return_value = {
+            "data": [{"id": "qwen-3-coder-30b-loaded-now"}]
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "",
+                     "base_url": "http://127.0.0.1:8080/v1",
+                     "provider": "custom",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("requests.get", return_value=fake_resp) as mock_get, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, _final, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        # /v1/models was queried on the local server
+        assert mock_get.called
+        called_url = mock_get.call_args[0][0]
+        assert called_url.endswith("/v1/models"), called_url
+        assert "127.0.0.1" in called_url
+        # AIAgent received the LIVE model id, not whatever was frozen earlier
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "qwen-3-coder-30b-loaded-now"
+
+    def test_job_with_explicit_model_skips_local_discovery(self, tmp_path):
+        """If the job pins a model, no extra HTTP roundtrip — the user's
+        choice is authoritative."""
+        job = {
+            "id": "pinned-job",
+            "name": "test",
+            "prompt": "hello",
+            "model": "user-pinned-model",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "",
+                     "base_url": "http://127.0.0.1:8080/v1",
+                     "provider": "custom",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("requests.get") as mock_get, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            run_job(job)
+
+        # No /v1/models query — explicit model wins
+        assert not mock_get.called
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["model"] == "user-pinned-model"
+
+    def test_cloud_provider_skips_local_discovery(self, tmp_path):
+        """Cloud providers (non-loopback base_url) must NOT incur an extra
+        HTTP roundtrip — the whole point of the gate."""
+        job = {
+            "id": "cloud-job",
+            "name": "test",
+            "prompt": "hello",
+            # No explicit model — but cloud provider, so still skip discovery.
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "sk-test",
+                     "base_url": "https://api.openai.com/v1",
+                     "provider": "openai",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("requests.get") as mock_get, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            run_job(job)
+
+        # No /v1/models query for cloud
+        assert not mock_get.called
+
+    def test_unreachable_local_server_surfaces_clear_error(self, tmp_path):
+        """When the local server is down, the job must fail with a clear,
+        actionable error message — not a generic 'Connection error' from
+        deep inside the agent loop."""
+        import requests as _requests
+
+        job = {
+            "id": "down-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "",
+                     "base_url": "http://127.0.0.1:8080/v1",
+                     "provider": "custom",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch(
+                 "requests.get",
+                 side_effect=_requests.exceptions.ConnectionError("refused"),
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, _final, error = run_job(job)
+
+        assert success is False
+        assert error is not None
+        # Clear, actionable message — not a bare "Connection error"
+        assert "not reachable" in error
+        assert "127.0.0.1" in error or "8080" in error
+        # AIAgent must NOT have been constructed — we failed before that
+        assert not mock_agent_cls.called
