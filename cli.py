@@ -1205,23 +1205,112 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
+_FENCE_LINE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})[^\n`]*$")
+_INLINE_CODE_RE = re.compile(r"`([^`\n]*)`")
+
+
+def _strip_markdown_emphasis_prose(prose: str) -> str:
+    """Strip emphasis / bold / strike / link markers from a prose segment.
+
+    Operates on text that is known to be OUTSIDE fenced code blocks and
+    OUTSIDE inline code spans, so it never sees content where literal
+    ``*`` or ``_`` characters carry program meaning (pointer syntax,
+    glob arguments, snake_case identifiers, etc.).
+    """
+    out = re.sub(r"!\[([^\]]*)\]\([^\)]*\)", r"\1", prose)
+    out = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", out)
+    out = re.sub(r"\*\*\*([^*]+)\*\*\*", r"\1", out)
+    out = re.sub(r"(?<!\w)___([^_]+)___(?!\w)", r"\1", out)
+    out = re.sub(r"\*\*([^*]+)\*\*", r"\1", out)
+    out = re.sub(r"(?<!\w)__([^_]+)__(?!\w)", r"\1", out)
+    out = re.sub(r"\*([^*]+)\*", r"\1", out)
+    out = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", out)
+    out = re.sub(r"~~([^~]+)~~", r"\1", out)
+    return out
+
+
+def _strip_markdown_prose_line(line: str) -> str:
+    """Strip emphasis from a prose line while preserving inline code spans.
+
+    Splits on backtick-delimited spans, applies emphasis stripping to the
+    surrounding text only, and re-emits the inline code content verbatim
+    (with the surrounding backticks dropped, matching the prior public
+    behaviour for inline code in prose).
+    """
+    if "`" not in line:
+        return _strip_markdown_emphasis_prose(line)
+
+    parts: list[str] = []
+    last = 0
+    for match in _INLINE_CODE_RE.finditer(line):
+        if match.start() > last:
+            parts.append(_strip_markdown_emphasis_prose(line[last:match.start()]))
+        # Emit inline-code body verbatim — no emphasis stripping. C/C++
+        # pointer syntax (``uint8_t* base``), regex literals (``\*+``),
+        # and similar carry literal ``*`` / ``_`` that would otherwise be
+        # eaten as bold / italic markers.
+        parts.append(match.group(1))
+        last = match.end()
+    if last < len(line):
+        parts.append(_strip_markdown_emphasis_prose(line[last:]))
+    return "".join(parts)
+
+
+def _is_fence_line(line: str) -> bool:
+    """True if ``line`` is a CommonMark code fence opener / closer."""
+    return bool(_FENCE_LINE_RE.match(line))
+
+
 def _strip_markdown_syntax(text: str) -> str:
-    """Best-effort markdown marker removal for plain-text display."""
+    """Best-effort markdown marker removal for plain-text display.
+
+    Code-block aware: lines inside fenced blocks (``\u0060\u0060\u0060`` /
+    ``~~~``) are emitted verbatim with the fence markers removed, so
+    program text containing literal ``*`` / ``_`` (e.g. C pointer syntax
+    like ``uint8_t* base = (uint8_t*)0x20000000;``) is preserved instead
+    of being collapsed by the bold / italic regex pass.
+    """
     plain = _rich_text_from_ansi(text or "").plain
-    plain = re.sub(r"^\s{0,3}(?:[-*_]\s*){3,}$", "", plain, flags=re.MULTILINE)
-    plain = re.sub(r"^\s{0,3}#{1,6}\s+", "", plain, flags=re.MULTILINE)
-    # Preserve blockquotes, lists, and checkboxes because they carry structure.
-    plain = re.sub(r"(```+|~~~+)", "", plain)
-    plain = re.sub(r"`([^`]*)`", r"\1", plain)
-    plain = re.sub(r"!\[([^\]]*)\]\([^\)]*\)", r"\1", plain)
-    plain = re.sub(r"\[([^\]]+)\]\([^\)]*\)", r"\1", plain)
-    plain = re.sub(r"\*\*\*([^*]+)\*\*\*", r"\1", plain)
-    plain = re.sub(r"(?<!\w)___([^_]+)___(?!\w)", r"\1", plain)
-    plain = re.sub(r"\*\*([^*]+)\*\*", r"\1", plain)
-    plain = re.sub(r"(?<!\w)__([^_]+)__(?!\w)", r"\1", plain)
-    plain = re.sub(r"\*([^*]+)\*", r"\1", plain)
-    plain = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", plain)
-    plain = re.sub(r"~~([^~]+)~~", r"\1", plain)
+
+    out_lines: list[str] = []
+    in_fence = False
+    fence_marker: str | None = None
+    for line in plain.split("\n"):
+        match = _FENCE_LINE_RE.match(line)
+        if match:
+            marker = match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker[0]
+                # Drop the fence opener line entirely (matches prior
+                # behaviour where ``re.sub(r"(```+|~~~+)", "", ...)``
+                # left an empty line, which the trailing ``\n{3,}``
+                # collapse then merged with neighbours).
+                continue
+            # In-fence: only treat as a closer if the marker character
+            # matches the opener. ``~~~`` does not close ``\u0060\u0060\u0060``.
+            if marker[0] == fence_marker:
+                in_fence = False
+                fence_marker = None
+                continue
+            # Otherwise it's a fence-looking line inside a different
+            # fence — preserve verbatim.
+            out_lines.append(line)
+            continue
+
+        if in_fence:
+            # Verbatim: do NOT run emphasis or inline-code stripping over
+            # code-block content. This is the asterisk-preservation fix.
+            out_lines.append(line)
+            continue
+
+        # Prose line: apply structural strips (HR, headings) then
+        # emphasis stripping that respects inline code spans.
+        stripped = re.sub(r"^\s{0,3}(?:[-*_]\s*){3,}$", "", line)
+        stripped = re.sub(r"^\s{0,3}#{1,6}\s+", "", stripped)
+        out_lines.append(_strip_markdown_prose_line(stripped))
+
+    plain = "\n".join(out_lines)
     plain = re.sub(r"\n{3,}", "\n\n", plain)
     return plain.strip("\n")
 
@@ -2078,6 +2167,14 @@ class HermesCLI:
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
         self._stream_started = False  # True once first delta arrives
         self._stream_box_opened = False  # True once the response box header is printed
+        # Fence-aware streaming strip: lines emitted while inside a fenced
+        # code block must NOT have emphasis / inline-code regexes run
+        # over them (e.g. C pointer syntax ``uint8_t* base`` would lose
+        # its asterisks). Track fence state across deltas so the per-line
+        # strip path can match the multi-line ``_strip_markdown_syntax``
+        # behaviour exactly.
+        self._stream_in_code_fence = False
+        self._stream_code_fence_marker: str | None = None
         self._reasoning_preview_buf = ""  # Coalesce tiny reasoning chunks for [thinking] output
         self._pending_edit_snapshots = {}
         self._last_input_mode_recovery = 0.0
@@ -3197,6 +3294,41 @@ class HermesCLI:
                 self._stream_prefilt = self._stream_prefilt[-max_tag_len:]
             return
 
+    def _strip_markdown_line_streaming(self, line: str) -> str:
+        """Per-line markdown strip that tracks fence state across calls.
+
+        The streaming display fires ``_emit_stream_text`` once per delta
+        and processes complete lines as they arrive. ``_strip_markdown_syntax``
+        already handles the multi-line case correctly, but the streaming
+        path can only show ``_strip_markdown_syntax`` one line at a time
+        — long after the originating fence opener was emitted. Track the
+        fence state on the streamer so a code-block line like
+        ``uint8_t* base = (uint8_t*)0x20000000;`` is preserved verbatim
+        even when its surrounding ``\u0060\u0060\u0060`` markers were
+        emitted in earlier deltas.
+        """
+        match = _FENCE_LINE_RE.match(line)
+        if match:
+            marker = match.group(1)
+            if not self._stream_in_code_fence:
+                self._stream_in_code_fence = True
+                self._stream_code_fence_marker = marker[0]
+                # Drop fence opener line, matching ``_strip_markdown_syntax``.
+                return ""
+            if marker[0] == self._stream_code_fence_marker:
+                self._stream_in_code_fence = False
+                self._stream_code_fence_marker = None
+                return ""
+            # Different fence char inside an open fence — preserve verbatim.
+            return line
+
+        if self._stream_in_code_fence:
+            return line
+
+        stripped = re.sub(r"^\s{0,3}(?:[-*_]\s*){3,}$", "", line)
+        stripped = re.sub(r"^\s{0,3}#{1,6}\s+", "", stripped)
+        return _strip_markdown_prose_line(stripped)
+
     def _emit_stream_text(self, text: str) -> None:
         """Emit filtered text to the streaming display."""
         if not text:
@@ -3247,7 +3379,7 @@ class HermesCLI:
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
             if self.final_response_markdown == "strip":
-                line = _strip_markdown_syntax(line)
+                line = self._strip_markdown_line_streaming(line)
             _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
 
     def _flush_stream(self) -> None:
@@ -3265,7 +3397,15 @@ class HermesCLI:
 
         if self._stream_buf:
             _tc = getattr(self, "_stream_text_ansi", "")
-            line = _strip_markdown_syntax(self._stream_buf) if self.final_response_markdown == "strip" else self._stream_buf
+            if self.final_response_markdown == "strip":
+                # Process any remaining lines through the same fence-aware
+                # streaming helper so a trailing line inside an unclosed
+                # fence still has its asterisks preserved.
+                pieces = self._stream_buf.split("\n")
+                processed = [self._strip_markdown_line_streaming(p) for p in pieces]
+                line = "\n".join(processed)
+            else:
+                line = self._stream_buf
             _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
             self._stream_buf = ""
 
@@ -3280,6 +3420,8 @@ class HermesCLI:
         self._stream_started = False
         self._stream_box_opened = False
         self._stream_text_ansi = ""
+        self._stream_in_code_fence = False
+        self._stream_code_fence_marker = None
         self._stream_prefilt = ""
         self._in_reasoning_block = False
         self._stream_last_was_newline = True
