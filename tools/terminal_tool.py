@@ -1920,7 +1920,34 @@ def terminal_tool(
                     "pid": proc_session.pid,
                     "exit_code": 0,
                     "error": None,
+                    # Surface the active terminal backend so the agent (and
+                    # human reviewers) can immediately tell whether this
+                    # background process runs on the host or inside a
+                    # sandbox. See issue #20127 ("Sandbox Trap"): when
+                    # TERMINAL_ENV is non-local, the spawned PID lives in
+                    # the sandbox and is invisible/unkillable from the
+                    # host, and write_file/read_file from the same task
+                    # also operate inside the sandbox.
+                    "backend": env_type,
                 }
+                if env_type != "local":
+                    result_data["backend_note"] = (
+                        f"This background process runs INSIDE the {env_type} "
+                        "sandbox, not on the host. Its PID is sandbox-local; "
+                        "host `ps`/`kill` will not see or signal it. Files "
+                        "written from this task (write_file, terminal) also "
+                        "land inside the sandbox unless a host bind mount "
+                        "is configured. Set TERMINAL_ENV=local (or run "
+                        "`hermes setup` and pick the local backend) if you "
+                        "want host-side processes and host-side filesystem "
+                        "writes."
+                    )
+                    logger.info(
+                        "Background process %s started on non-local backend "
+                        "%r (sandboxed; not visible to host process tools)",
+                        proc_session.id,
+                        env_type,
+                    )
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
