@@ -37,8 +37,95 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
+from utils import base_url_hostname
 
 logger = logging.getLogger(__name__)
+
+# Loopback hostnames considered "local" for the purposes of runtime model
+# discovery. We deliberately re-declare this small set here (rather than
+# importing ``_loopback_hostname`` from ``hermes_cli.runtime_provider``) so
+# the cron path has no new private-symbol dependency.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _is_local_base_url(base_url: str) -> bool:
+    """True iff ``base_url`` resolves to a loopback hostname."""
+    if not base_url:
+        return False
+    host = (base_url_hostname(base_url) or "").lower().rstrip(".")
+    return host in _LOOPBACK_HOSTS
+
+
+def _query_local_loaded_model(base_url: str, timeout: float = 5.0) -> str:
+    """Return the first model id reported by a local OpenAI-compatible server.
+
+    Hits ``{base_url}/v1/models`` (adding ``/v1`` if missing) and returns the
+    first ``data[].id`` it finds. Used by cron jobs that have no pinned model
+    so we always send a request for whatever the local llama.cpp / Ollama /
+    LM Studio server currently has loaded — instead of a model id frozen at
+    job-creation time.
+
+    Raises ``RuntimeError`` with a clear message when the server is
+    unreachable, the response is malformed, or no models are loaded.
+    """
+    if not base_url:
+        raise RuntimeError("local model discovery requires a base_url")
+
+    import requests  # local import: avoid pulling requests for non-local jobs
+
+    url = base_url.rstrip("/")
+    if not url.endswith("/v1"):
+        url += "/v1"
+    url += "/models"
+
+    try:
+        resp = requests.get(url, timeout=timeout)
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            f"local inference server not reachable at {base_url} "
+            f"(GET {url} failed: {exc}). Is the llama.cpp / Ollama / LM Studio "
+            "server running?"
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            f"local inference server at {base_url} did not respond within "
+            f"{timeout:.0f}s (GET {url}). Is it overloaded or stuck?"
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"local inference server at {base_url} returned an error "
+            f"(GET {url}: {exc})."
+        ) from exc
+
+    if not resp.ok:
+        raise RuntimeError(
+            f"local inference server at {base_url} returned HTTP "
+            f"{resp.status_code} for GET {url}."
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"local inference server at {base_url} returned non-JSON for "
+            f"GET {url}: {exc}."
+        ) from exc
+
+    models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(models, list) or not models:
+        raise RuntimeError(
+            f"local inference server at {base_url} reports no loaded models. "
+            "Load a model in llama.cpp / Ollama / LM Studio first."
+        )
+
+    first = models[0] if isinstance(models[0], dict) else {}
+    model_id = (first.get("id") or "").strip()
+    if not model_id:
+        raise RuntimeError(
+            f"local inference server at {base_url} returned a malformed "
+            f"/models payload (missing 'id')."
+        )
+    return model_id
 
 
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
@@ -1175,6 +1262,40 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
+
+        # Local-inference live model discovery (issue #20125).
+        #
+        # Cron jobs created without an explicit ``model`` freeze whatever
+        # ``model.default`` was set in config.yaml at create time. If the
+        # local llama.cpp / Ollama / LM Studio server has since loaded a
+        # different model (or is down), the request 400s with a generic
+        # "Connection error" and the job fails silently.
+        #
+        # When the runtime resolves to a local (loopback) endpoint AND the
+        # job did not pin a model, ask the server what it currently has
+        # loaded. On unreachable server, raise a clear, actionable error
+        # instead of letting the agent hit a confusing connect failure.
+        #
+        # Cloud providers (OpenAI / Anthropic / OpenRouter / …) skip this
+        # path entirely — no extra HTTP roundtrip.
+        if not job.get("model"):
+            _runtime_base_url = (runtime.get("base_url") or "").strip()
+            if _is_local_base_url(_runtime_base_url):
+                try:
+                    _live_model = _query_local_loaded_model(_runtime_base_url)
+                except RuntimeError as exc:
+                    # Re-raise with job context so the failure surfaces
+                    # in the job's output / alert, not just logs.
+                    raise RuntimeError(
+                        f"Job '{job_id}': {exc}"
+                    ) from exc
+                if _live_model and _live_model != model:
+                    logger.info(
+                        "Job '%s': using live local model %r from %s "
+                        "(config.yaml had %r)",
+                        job_id, _live_model, _runtime_base_url, model,
+                    )
+                model = _live_model
         if runtime_provider:
             try:
                 from agent.credential_pool import load_pool
