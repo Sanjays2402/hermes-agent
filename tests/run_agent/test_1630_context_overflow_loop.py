@@ -5,7 +5,8 @@ Verifies that:
    and trigger compression instead of aborting.
 2. The gateway does not persist messages when the agent fails early, preventing
    the session from growing on each failure.
-3. Context-overflow failures produce helpful error messages suggesting /compact.
+3. Context-overflow failures produce helpful error messages suggesting
+   /compress (the actual gateway command, not /compact).
 """
 
 import pytest
@@ -255,6 +256,30 @@ class TestContextOverflowErrorMessages:
             and history_len > 50
         )
         assert not _is_ctx_fail
+
+    def test_overflow_tip_points_at_compress_command(self):
+        """Regression for #20020: the context-overflow tip in gateway/run.py
+        must reference /compress, the actual gateway command. Pointing at
+        /compact (a TUI display toggle) leaves users with a 'command not
+        found' response when they follow the suggestion.
+        """
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[2]
+        source = (repo_root / "gateway" / "run.py").read_text(encoding="utf-8")
+
+        # The fixed tip text must be present at least once — there are two
+        # error paths (sync handler + async handler) that emit it.
+        assert source.count("Use /compress to compress the conversation") >= 2, (
+            "Both context-overflow error paths in gateway/run.py should tell "
+            "users to run /compress."
+        )
+
+        # The buggy text must not survive in the overflow tip strings.
+        assert "Use /compact to compress the conversation" not in source, (
+            "gateway/run.py still tells users to run /compact, which is not "
+            "a registered gateway command."
+        )
 
 
 # ---------------------------------------------------------------------------
