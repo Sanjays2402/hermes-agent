@@ -213,6 +213,193 @@ class TestSendMessageTool:
             user_id="user-123",
         )
 
+    def test_session_thread_id_inherited_when_target_chat_matches(self):
+        """#20104: text/media replies should inherit the active session's thread."""
+        config, telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_ID": "-1001",
+                "HERMES_SESSION_THREAD_ID": "17585",
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-1001",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="17585",
+            media_files=[],
+        )
+        mirror_mock.assert_called_once_with(
+            "telegram",
+            "-1001",
+            "hello",
+            source_label="telegram",
+            thread_id="17585",
+            user_id=None,
+        )
+
+    def test_session_thread_id_not_inherited_for_different_chat(self):
+        """#20104: must not graft a thread onto an unrelated chat."""
+        config, telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_ID": "-1001",
+                "HERMES_SESSION_THREAD_ID": "17585",
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-9999",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-9999",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
+
+    def test_session_thread_id_not_inherited_across_platforms(self):
+        """#20104: a Telegram session thread must not leak into Discord sends."""
+        config, _telegram_cfg = _make_config()
+        discord_cfg = SimpleNamespace(enabled=True, token="***", extra={})
+        config.platforms[Platform.DISCORD] = discord_cfg
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_ID": "-1001",
+                "HERMES_SESSION_THREAD_ID": "17585",
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "discord:-1001",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.DISCORD,
+            discord_cfg,
+            "-1001",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
+
+    def test_explicit_thread_id_in_target_overrides_session_thread(self):
+        """#20104: explicit thread in target wins over session thread."""
+        config, telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_ID": "-1001",
+                "HERMES_SESSION_THREAD_ID": "17585",
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-1001:42",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="42",
+            media_files=[],
+        )
+
+    def test_session_thread_id_inherited_when_using_home_channel(self):
+        """#20104: bare 'telegram' target falls back to home channel and inherits thread."""
+        config, telegram_cfg = _make_config()
+        home = SimpleNamespace(chat_id="-1001")
+        config.get_home_channel = lambda _platform: home
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_CHAT_ID": "-1001",
+                "HERMES_SESSION_THREAD_ID": "17585",
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="17585",
+            media_files=[],
+        )
+
     def test_top_level_send_failure_redacts_query_token(self):
         config, _telegram_cfg = _make_config()
         leaked = "very-secret-query-token-123456"
