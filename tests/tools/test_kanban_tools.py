@@ -153,6 +153,174 @@ def test_complete_rejects_non_dict_metadata(worker_env):
     assert json.loads(out).get("error")
 
 
+# ---------------------------------------------------------------------------
+# created_cards verification (regression tests for #20017)
+# ---------------------------------------------------------------------------
+#
+# kanban_complete used to accept arbitrary metadata about created
+# cards with no verification. Workers could fabricate ids in their
+# handoff and the kernel believed them. The fix: opt-in
+# ``created_cards`` field that, when provided, must list real task
+# ids that are children of the task being completed.
+
+
+def test_complete_without_created_cards_field_still_works(worker_env):
+    """Backwards compat: omitting created_cards must not trigger any
+    verification (workers / CLIs that don't set the field keep working)."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "old-style handoff"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["task_id"] == worker_env
+    # New field is only echoed back when the caller supplied it.
+    assert "created_cards" not in d
+
+
+def test_complete_accepts_valid_created_cards(worker_env):
+    """Real child cards spawned via kanban_create must be accepted and
+    echoed back in the response."""
+    from tools import kanban_tools as kt
+    # Spawn two real child cards under the worker's task.
+    a = json.loads(kt._handle_create({
+        "title": "remediation A", "assignee": "qa",
+        "parents": [worker_env],
+    }))
+    b = json.loads(kt._handle_create({
+        "title": "remediation B", "assignee": "qa",
+        "parents": [worker_env],
+    }))
+    assert a["ok"] and b["ok"]
+
+    out = kt._handle_complete({
+        "summary": "spawned remediation",
+        "created_cards": [a["task_id"], b["task_id"]],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert set(d["created_cards"]) == {a["task_id"], b["task_id"]}
+
+
+def test_complete_rejects_fabricated_created_cards(worker_env):
+    """#20017: a worker that lists task ids that don't exist must be
+    rejected with a clear error, and the task must NOT be completed."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "claims to have spawned remediation",
+        "created_cards": ["t_FAKE1", "t_FAKE2"],
+    })
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    err = d.get("error", "")
+    assert "created_cards verification failed" in err
+    assert "t_FAKE1" in err and "t_FAKE2" in err
+
+    # Task must still be running — verification runs before mutation.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_rejects_non_child_created_cards(worker_env):
+    """A real task id that wasn't spawned by this worker must still be
+    rejected — existence alone isn't enough, the worker has to actually
+    be the parent."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        # A real, unrelated task with no link to the worker's task.
+        sibling = kb.create_task(conn, title="unrelated", assignee="peer")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "sneaky claim",
+        "created_cards": [sibling],
+    })
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    err = d.get("error", "")
+    assert "not children of" in err
+    assert sibling in err
+
+    # Worker task untouched.
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_rejects_mixed_valid_and_fabricated(worker_env):
+    """One real child + one fake id must reject the whole call — no
+    partial credit, and the task stays running."""
+    from tools import kanban_tools as kt
+    real = json.loads(kt._handle_create({
+        "title": "real child", "assignee": "qa",
+        "parents": [worker_env],
+    }))
+    assert real["ok"]
+
+    out = kt._handle_complete({
+        "summary": "half real",
+        "created_cards": [real["task_id"], "t_FAKE"],
+    })
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "t_FAKE" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_rejects_non_list_created_cards(worker_env):
+    """A bare string or dict must not silently iterate; we want a clear
+    error so workers don't accidentally pass one id as a string."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "x", "created_cards": "t_ONE",
+    })
+    assert "must be a list" in json.loads(out).get("error", "")
+
+    out = kt._handle_complete({
+        "summary": "x", "created_cards": {"id": "t_ONE"},
+    })
+    assert "must be a list" in json.loads(out).get("error", "")
+
+    out = kt._handle_complete({
+        "summary": "x", "created_cards": ["t_OK", 42],
+    })
+    assert "must be strings" in json.loads(out).get("error", "")
+
+
+def test_complete_dedupes_and_strips_created_cards(worker_env):
+    """Whitespace-only entries are dropped and duplicates are deduped
+    before verification, so a sloppy list still works."""
+    from tools import kanban_tools as kt
+    child = json.loads(kt._handle_create({
+        "title": "only child", "assignee": "qa",
+        "parents": [worker_env],
+    }))
+    assert child["ok"]
+
+    out = kt._handle_complete({
+        "summary": "clean me up",
+        "created_cards": [
+            child["task_id"], "   ", child["task_id"], "",
+            f"  {child['task_id']}  ",
+        ],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["created_cards"] == [child["task_id"]]
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})
