@@ -263,6 +263,15 @@ def _handle_send(args):
                 f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
             })
 
+    # If the caller did not pin a thread explicitly and we're sending into
+    # the same chat as the active gateway session, inherit the session's
+    # thread_id so text/media/file replies stay in the topic the user is
+    # actually conversing in. The voice path (gateway-side _send_voice_reply)
+    # already does this via event.source.thread_id; this mirrors that
+    # behavior for the agent-tool path. See issue #20104.
+    if thread_id is None:
+        thread_id = _resolve_session_thread_id(platform_name, chat_id)
+
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
@@ -368,6 +377,45 @@ def _describe_media_for_mirror(media_files):
             return "[Sent audio attachment]"
         return "[Sent document attachment]"
     return f"[Sent {len(media_files)} media attachments]"
+
+
+def _resolve_session_thread_id(platform_name: str, chat_id) -> Optional[str]:
+    """Return the active gateway session's thread_id when it applies to ``chat_id``.
+
+    The send_message tool can be called with a bare ``platform`` target (home
+    channel) or a ``platform:chat_id`` target without an explicit thread. When
+    the agent is currently replying inside a Telegram topic, Discord thread,
+    Matrix thread, or Feishu thread, those follow-up messages should land in
+    the same thread instead of the parent chat. Voice messages already get
+    this for free because the gateway dispatches them with
+    ``event.source.thread_id``; this helper closes the same gap for the
+    text/media/file path that flows through the send_message tool.
+
+    Returns ``None`` when the platform doesn't match, the chat doesn't match,
+    or no session thread is set — leaving outbound delivery on the parent chat.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    session_platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    if not session_platform or session_platform != (platform_name or "").lower():
+        return None
+
+    session_thread = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
+    if not session_thread:
+        return None
+
+    session_chat = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    # Only inherit the thread when the outbound chat is the same chat where
+    # the session is anchored. Without this guard we'd attach the current
+    # session's thread_id to an unrelated chat and either silently fail or
+    # post into the wrong topic.
+    if not session_chat or str(chat_id) != session_chat:
+        return None
+
+    return session_thread
 
 
 def _get_cron_auto_delivery_target():
