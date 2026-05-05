@@ -210,6 +210,7 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    created_cards = args.get("created_cards")
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"
@@ -218,9 +219,73 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if created_cards is not None:
+        if isinstance(created_cards, str):
+            # Reject the easy mistake: a single id as a string. Workers
+            # that fan out to more than one card would silently iterate
+            # over characters here, so demand a list explicitly.
+            return tool_error(
+                "created_cards must be a list of task ids, got a string "
+                "(wrap a single id in a list)"
+            )
+        if not isinstance(created_cards, (list, tuple)):
+            return tool_error(
+                f"created_cards must be a list of task ids, got "
+                f"{type(created_cards).__name__}"
+            )
+        # Normalise: drop empties / whitespace, dedupe preserving order.
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in created_cards:
+            if not isinstance(raw, str):
+                return tool_error(
+                    f"created_cards entries must be strings, got "
+                    f"{type(raw).__name__}"
+                )
+            cid = raw.strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            cleaned.append(cid)
+        created_cards = cleaned
     try:
         kb, conn = _connect()
         try:
+            # Verify each claimed card BEFORE mutating task state, so a
+            # rejection leaves the task running and gives the worker a
+            # chance to fix its handoff. See #20017 — without this, a
+            # worker can claim it spawned remediation cards t_X/t_Y/t_Z
+            # and the kernel takes its word, even when those ids don't
+            # exist or were spawned by some unrelated task.
+            if created_cards:
+                missing: list[str] = []
+                wrong_parent: list[str] = []
+                for cid in created_cards:
+                    child = kb.get_task(conn, cid)
+                    if child is None:
+                        missing.append(cid)
+                        continue
+                    parents = kb.parent_ids(conn, cid)
+                    if tid not in parents:
+                        wrong_parent.append(cid)
+                if missing or wrong_parent:
+                    parts = []
+                    if missing:
+                        parts.append(
+                            f"do not exist: {', '.join(missing)}"
+                        )
+                    if wrong_parent:
+                        parts.append(
+                            f"not children of {tid}: "
+                            f"{', '.join(wrong_parent)}"
+                        )
+                    return tool_error(
+                        "created_cards verification failed — "
+                        + "; ".join(parts)
+                        + ". Use kanban_create with parents=[<this task "
+                        "id>] to spawn child cards before claiming them "
+                        "in kanban_complete."
+                    )
             ok = kb.complete_task(
                 conn, tid,
                 result=result, summary=summary, metadata=metadata,
@@ -230,7 +295,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            response: dict[str, Any] = {
+                "task_id": tid,
+                "run_id": run.id if run else None,
+            }
+            if created_cards:
+                response["created_cards"] = list(created_cards)
+            return _ok(**response)
         finally:
             conn.close()
     except Exception as e:
@@ -452,7 +523,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required."
+        "``summary`` or ``result`` is required. If your run spawned "
+        "follow-up cards (via kanban_create), list their ids in "
+        "``created_cards`` so the kernel can verify them — "
+        "unverified claims in ``metadata`` are easy to fabricate and "
+        "will not be trusted."
     ),
     "parameters": {
         "type": "object",
@@ -485,6 +560,20 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task.result). Use ``summary`` instead when "
                     "possible; this exists for compatibility with "
                     "callers that still set --result on the CLI."
+                ),
+            },
+            "created_cards": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of task ids you spawned during this "
+                    "run (e.g. via kanban_create with parents=[<this "
+                    "task id>]). The kernel verifies each id exists and "
+                    "is a child of the task being completed. Use this "
+                    "whenever your handoff claims to have created "
+                    "follow-up / remediation cards — unverified claims "
+                    "in ``metadata`` are not trusted by downstream "
+                    "workers."
                 ),
             },
         },
